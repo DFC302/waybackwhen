@@ -1,0 +1,215 @@
+#!/bin/bash
+# =========================================
+# Multi-source URL Enumerator (Improved Version)
+# Simplified logging + deletes empty results
+# =========================================
+
+apply_exclude=false
+apply_apex=false
+run_check=false
+input_file=""
+concurrency=1
+log_file=""
+exclude_pattern=".css|.jpg|.jpeg|.png|.svg|.img|.gif|.mp4|.flv|.ogv|.webm|.webp|.mov|.mp3|.m4a|.m4p|.scss|.tif|.tiff|.ttf|.otf|.woff|.woff2|.bmp|.ico|.eot|.htc|.rtf|.swf|.image|/image|/img|/css|/wp-json|/wp-content|/wp-includes|/theme|/audio|/captcha|/font|node_modules|/jquery|/bootstrap"
+
+# --- Parse args ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -e|--exclude) apply_exclude=true; shift ;;
+    -a|--apex) apply_apex=true; shift ;;
+    -c|--check) run_check=true; shift ;;
+    -f|--file) input_file="$2"; shift 2 ;;
+    -p|--parallel) concurrency="$2"; shift 2 ;;
+    -l|--log) log_file="$2"; shift 2 ;;
+    -*)
+      echo "[!] Unknown option: $1"
+      echo "Usage: $0 [--exclude|-e] [--apex|-a] [--check|-c] [--file|-f file] [--parallel|-p N] [--log|-l logfile] [domain]"
+      exit 1 ;;
+    *) single_domain="$1"; shift ;;
+  esac
+done
+
+# --- Tool check function ---
+check_tools() {
+  local ok="[OK]"
+  local miss="[MISSING]"
+  local fmt="  %-15s %-10s %s\n"
+
+  printf "\n waybackwhen — tool check\n"
+  printf " %-15s %-10s %s\n" "TOOL" "STATUS" "PATH"
+  printf " %s\n" "-----------------------------------------------"
+
+  # Go binaries — check PATH first, then ~/go/bin/
+  local path
+  for tool in waybackurls gau urlfinder; do
+    path=$(command -v "$tool" 2>/dev/null)
+    if [ -z "$path" ] && [ -x "$HOME/go/bin/$tool" ]; then
+      path="$HOME/go/bin/$tool"
+    fi
+    if [ -n "$path" ]; then
+      printf " $fmt" "$tool" "$ok" "$path"
+    else
+      printf " $fmt" "$tool" "$miss" "-"
+    fi
+  done
+
+  # paramspider — PATH only
+  local ps_path
+  ps_path=$(command -v paramspider 2>/dev/null)
+  if [ -n "$ps_path" ]; then
+    printf " $fmt" "paramspider" "$ok" "$ps_path"
+  else
+    printf " $fmt" "paramspider" "$miss" "-"
+  fi
+
+  # waymore — python script
+  local wm_path="$HOME/tools/waymore/waymore.py"
+  if [ -f "$wm_path" ]; then
+    printf " $fmt" "waymore" "$ok" "$wm_path"
+  else
+    local wm_cmd
+    wm_cmd=$(command -v waymore 2>/dev/null)
+    [ -n "$wm_cmd" ] && printf " $fmt" "waymore" "$ok" "$wm_cmd" \
+                      || printf " $fmt" "waymore" "$miss" "-"
+  fi
+
+  # python3
+  local py_path
+  py_path=$(command -v python3 2>/dev/null)
+  if [ -n "$py_path" ]; then
+    printf " $fmt" "python3" "$ok" "$py_path"
+  else
+    printf " $fmt" "python3" "$miss" "-"
+  fi
+
+  # tldextract — Python module
+  local tld_path
+  tld_path=$(python3 -c "import tldextract, os; print(os.path.dirname(tldextract.__file__))" 2>/dev/null)
+  if [ -n "$tld_path" ]; then
+    printf " $fmt" "tldextract" "$ok" "$tld_path"
+  else
+    printf " $fmt" "tldextract" "$miss" "(pip install tldextract)"
+  fi
+
+  printf "\n"
+}
+
+if $run_check; then
+  check_tools
+  exit 0
+fi
+
+# --- Apex extraction helper ---
+extract_apex() {
+  python3 - "$1" <<'EOF'
+import sys
+try:
+    import tldextract
+    result = tldextract.extract(sys.argv[1])
+    apex = result.registered_domain
+    print(apex if apex else sys.argv[1])
+except ImportError:
+    # Fallback: take last two labels
+    parts = sys.argv[1].split(".")
+    print(".".join(parts[-2:]) if len(parts) >= 2 else sys.argv[1])
+EOF
+}
+
+export -f extract_apex
+
+# --- Build domain list ---
+if [ -n "$input_file" ]; then
+  [ ! -f "$input_file" ] && echo "[!] File not found: $input_file" && exit 1
+  mapfile -t domains < "$input_file"
+elif [ -n "$single_domain" ]; then
+  domains=("$single_domain")
+else
+  mapfile -t domains
+fi
+
+# --- Logging setup ---
+timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
+if [ -n "$log_file" ]; then
+  [[ "$log_file" != *.log ]] && log_file="${log_file}.log"
+  echo "[*] Run started at $timestamp" >"$log_file"
+fi
+
+# --- Core Function ---
+process_domain() {
+  domain="$1"
+  exclude_flag="$2"
+  log_file="$3"
+  apex_flag="$4"
+
+  domain=$(echo "$domain" | sed -E 's#https?://##;s#/$##')
+  [ -z "$domain" ] && return
+
+  # Strip to apex if requested
+  if [ "$apex_flag" = "true" ]; then
+    domain=$(extract_apex "$domain")
+    [ -z "$domain" ] && return
+  fi
+
+  domain_file=$(echo "$domain" | tr . _)
+  output_file="${domain_file}.wbw"
+  tmpfile=$(mktemp)
+  tmpfile_gau=$(mktemp)
+  tmpfile_urlfinder=$(mktemp)
+  tmpfile_ps=$(mktemp)
+  trap 'rm -f "$tmpfile" "$tmpfile_gau" "$tmpfile_urlfinder" "$tmpfile_ps"' EXIT
+  start_time=$(date +"%H:%M:%S")
+
+  # Log start
+  [ -n "$log_file" ] && echo "[+] $domain started at $start_time" >>"$log_file"
+  echo "[*] Enumerating: $domain"
+
+  # --- Run tools ---
+  # gau and urlfinder run in parallel (different backends, no Wayback contention)
+  ~/go/bin/gau "$domain" 2>/dev/null >>"$tmpfile_gau" &
+  pid_gau=$!
+  echo "$domain" | ~/go/bin/urlfinder -silent 2>/dev/null >>"$tmpfile_urlfinder" &
+  pid_urlfinder=$!
+
+  # waybackurls, waymore, paramspider run sequentially (all hit Wayback/archives)
+  echo "$domain" | ~/go/bin/waybackurls 2>/dev/null >>"$tmpfile"
+  python3 ~/tools/waymore/waymore.py -i "$domain" -mode U -oU "$tmpfile" >/dev/null 2>&1
+  paramspider -d "$domain" -o "$tmpfile_ps" 2>/dev/null || true
+  [ -s "$tmpfile_ps" ] && grep -v '^$' "$tmpfile_ps" >>"$tmpfile"
+
+  # Wait for parallel tools and merge
+  wait $pid_gau
+  wait $pid_urlfinder
+  cat "$tmpfile_gau" "$tmpfile_urlfinder" >>"$tmpfile"
+
+  # --- Process results ---
+  if $exclude_flag; then
+    grep -Ev "$exclude_pattern" "$tmpfile" | sort -u >"$output_file"
+  else
+    sort -u "$tmpfile" >"$output_file"
+  fi
+  rm -f "$tmpfile"
+
+  number_of_findings=$(grep -Ev '^[[:space:]]*$' "$output_file" | wc -l)
+  end_time=$(date +"%H:%M:%S")
+
+  if [ "$number_of_findings" -gt 0 ]; then
+    echo "[+] $domain completed ($number_of_findings URLs)"
+    [ -n "$log_file" ] && echo "[✓] $domain completed at $end_time → $number_of_findings URLs" >>"$log_file"
+  else
+    echo "[-] $domain produced no results. Deleting output."
+    rm -f "$output_file"
+    [ -n "$log_file" ] && echo "[-] $domain completed at $end_time → 0 URLs (deleted)" >>"$log_file"
+  fi
+}
+
+export -f process_domain
+export exclude_pattern
+
+# --- Parallel Execution ---
+printf "[*] Starting enumeration with concurrency: %s\n" "$concurrency"
+printf "[*] Exclusions: %s\n" "$($apply_exclude && echo Enabled || echo Disabled)"
+printf "[*] Apex mode: %s\n\n" "$($apply_apex && echo Enabled || echo Disabled)"
+
+printf "%s\n" "${domains[@]}" | xargs -P "$concurrency" -I {} bash -c 'process_domain "{}" '"$apply_exclude"' "'"$log_file"'" '"$apply_apex"
+echo -e "\n[✓] All domains processed at $(date +"%H:%M:%S")."
+[ -n "$log_file" ] && echo "[*] Full log saved to: $log_file"
