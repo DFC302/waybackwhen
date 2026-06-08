@@ -94,12 +94,15 @@ waybackwhen [options] [domain]
 
 | Flag | Long form | Description |
 |------|-----------|-------------|
-| `-e` | `--exclude` | Filter out static assets (images, fonts, CSS, JS libraries, etc.) |
-| `-a` | `--apex` | Strip subdomain — run all tools against the registered apex domain instead |
-| `-c` | `--check` | Check which tools are installed and exit |
+| `-e` | `--exclude` | Filter out static assets (images, fonts, CSS, JS libraries, etc.) from all results |
+| `-a` | `--apex` | Strip subdomain and run all tools against the registered apex domain instead |
+| `-c` | `--check` | Check which tools are installed and where, then exit |
+| `-s TOOLS` | `--skip TOOLS` | Comma-separated list of tools to skip (e.g. `waymore` or `gau,waybackurls`) |
 | `-f FILE` | `--file FILE` | Read domains from a file (one per line) |
 | `-p N` | `--parallel N` | Number of domains to process concurrently (default: 1) |
 | `-l FILE` | `--log FILE` | Write a timestamped run log to FILE (`.log` extension added if missing) |
+
+**Valid tool names for `--skip`:** `waybackurls`, `gau`, `urlfinder`, `waymore`, `paramspider`
 
 ### Input methods
 
@@ -143,9 +146,19 @@ waybackwhen --exclude example.com
 waybackwhen -f domains.txt -p 5 -l run.log
 ```
 
-**Full combination — apex, exclude, parallel, log:**
+**Skip a slow tool for a faster run:**
 ```bash
-waybackwhen -f subdomains.txt --apex --exclude -p 3 -l hunt.log
+waybackwhen --skip waymore example.com
+```
+
+**Skip multiple tools:**
+```bash
+waybackwhen --skip gau,waybackurls example.com
+```
+
+**Full combination — apex, exclude, skip, parallel, log:**
+```bash
+waybackwhen -f subdomains.txt --apex --exclude --skip waymore -p 3 -l hunt.log
 ```
 
 ---

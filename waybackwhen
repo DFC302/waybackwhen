@@ -7,6 +7,7 @@
 apply_exclude=false
 apply_apex=false
 run_check=false
+skip_tools=""
 input_file=""
 concurrency=1
 log_file=""
@@ -15,19 +16,35 @@ exclude_pattern=".css|.jpg|.jpeg|.png|.svg|.img|.gif|.mp4|.flv|.ogv|.webm|.webp|
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -e|--exclude) apply_exclude=true; shift ;;
-    -a|--apex) apply_apex=true; shift ;;
-    -c|--check) run_check=true; shift ;;
-    -f|--file) input_file="$2"; shift 2 ;;
+    -e|--exclude)  apply_exclude=true; shift ;;
+    -a|--apex)     apply_apex=true; shift ;;
+    -c|--check)    run_check=true; shift ;;
+    -s|--skip)     skip_tools="$2"; shift 2 ;;
+    -f|--file)     input_file="$2"; shift 2 ;;
     -p|--parallel) concurrency="$2"; shift 2 ;;
-    -l|--log) log_file="$2"; shift 2 ;;
+    -l|--log)      log_file="$2"; shift 2 ;;
     -*)
       echo "[!] Unknown option: $1"
-      echo "Usage: $0 [--exclude|-e] [--apex|-a] [--check|-c] [--file|-f file] [--parallel|-p N] [--log|-l logfile] [domain]"
+      echo "Usage: $0 [--exclude|-e] [--apex|-a] [--check|-c] [--skip|-s tools] [--file|-f file] [--parallel|-p N] [--log|-l logfile] [domain]"
       exit 1 ;;
     *) single_domain="$1"; shift ;;
   esac
 done
+
+# --- Validate --skip tool names ---
+_valid_tools="waybackurls gau urlfinder waymore paramspider"
+if [ -n "$skip_tools" ]; then
+  IFS=',' read -ra _skip_arr <<< "$skip_tools"
+  for _t in "${_skip_arr[@]}"; do
+    _t="${_t// /}"  # strip any accidental spaces
+    if [[ ! " $_valid_tools " =~ " $_t " ]]; then
+      echo "[!] Unknown tool: '$_t'. Valid tools: $_valid_tools"
+      exit 1
+    fi
+  done
+  unset _skip_arr _t
+fi
+unset _valid_tools
 
 # --- Tool check function ---
 check_tools() {
@@ -115,7 +132,14 @@ except ImportError:
 EOF
 }
 
+# Returns 0 (true) if tool should be skipped
+_skip_tool() {
+  local tool="$1" skip_list="$2"
+  [[ ",$skip_list," == *",$tool,"* ]]
+}
+
 export -f extract_apex
+export -f _skip_tool
 
 # --- Build domain list ---
 if [ -n "$input_file" ]; then
@@ -140,6 +164,7 @@ process_domain() {
   exclude_flag="$2"
   log_file="$3"
   apex_flag="$4"
+  skip_list="$5"
 
   domain=$(echo "$domain" | sed -E 's#https?://##;s#/$##')
   [ -z "$domain" ] && return
@@ -165,20 +190,36 @@ process_domain() {
 
   # --- Run tools ---
   # gau and urlfinder run in parallel (different backends, no Wayback contention)
-  ~/go/bin/gau "$domain" 2>/dev/null >>"$tmpfile_gau" &
-  pid_gau=$!
-  echo "$domain" | ~/go/bin/urlfinder -silent 2>/dev/null >>"$tmpfile_urlfinder" &
-  pid_urlfinder=$!
+  pid_gau=""
+  pid_urlfinder=""
+
+  if ! _skip_tool "gau" "$skip_list"; then
+    ~/go/bin/gau "$domain" 2>/dev/null >>"$tmpfile_gau" &
+    pid_gau=$!
+  fi
+
+  if ! _skip_tool "urlfinder" "$skip_list"; then
+    echo "$domain" | ~/go/bin/urlfinder -silent 2>/dev/null >>"$tmpfile_urlfinder" &
+    pid_urlfinder=$!
+  fi
 
   # waybackurls, waymore, paramspider run sequentially (all hit Wayback/archives)
-  echo "$domain" | ~/go/bin/waybackurls 2>/dev/null >>"$tmpfile"
-  python3 ~/tools/waymore/waymore.py -i "$domain" -mode U -oU "$tmpfile" >/dev/null 2>&1
-  paramspider -d "$domain" -o "$tmpfile_ps" 2>/dev/null || true
-  [ -s "$tmpfile_ps" ] && grep -v '^$' "$tmpfile_ps" >>"$tmpfile"
+  if ! _skip_tool "waybackurls" "$skip_list"; then
+    echo "$domain" | ~/go/bin/waybackurls 2>/dev/null >>"$tmpfile"
+  fi
+
+  if ! _skip_tool "waymore" "$skip_list"; then
+    python3 ~/tools/waymore/waymore.py -i "$domain" -mode U -oU "$tmpfile" >/dev/null 2>&1
+  fi
+
+  if ! _skip_tool "paramspider" "$skip_list"; then
+    paramspider -d "$domain" -o "$tmpfile_ps" 2>/dev/null || true
+    [ -s "$tmpfile_ps" ] && grep -v '^$' "$tmpfile_ps" >>"$tmpfile"
+  fi
 
   # Wait for parallel tools and merge
-  wait $pid_gau
-  wait $pid_urlfinder
+  [ -n "$pid_gau" ] && wait "$pid_gau"
+  [ -n "$pid_urlfinder" ] && wait "$pid_urlfinder"
   cat "$tmpfile_gau" "$tmpfile_urlfinder" >>"$tmpfile"
 
   # --- Process results ---
@@ -208,8 +249,9 @@ export exclude_pattern
 # --- Parallel Execution ---
 printf "[*] Starting enumeration with concurrency: %s\n" "$concurrency"
 printf "[*] Exclusions: %s\n" "$($apply_exclude && echo Enabled || echo Disabled)"
-printf "[*] Apex mode: %s\n\n" "$($apply_apex && echo Enabled || echo Disabled)"
+printf "[*] Apex mode:  %s\n" "$($apply_apex && echo Enabled || echo Disabled)"
+printf "[*] Skip tools: %s\n\n" "${skip_tools:-none}"
 
-printf "%s\n" "${domains[@]}" | xargs -P "$concurrency" -I {} bash -c 'process_domain "{}" '"$apply_exclude"' "'"$log_file"'" '"$apply_apex"
+printf "%s\n" "${domains[@]}" | xargs -P "$concurrency" -I {} bash -c 'process_domain "{}" '"$apply_exclude"' "'"$log_file"'" '"$apply_apex"' "'"$skip_tools"'"'
 echo -e "\n[✓] All domains processed at $(date +"%H:%M:%S")."
 [ -n "$log_file" ] && echo "[*] Full log saved to: $log_file"
