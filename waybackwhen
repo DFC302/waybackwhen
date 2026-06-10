@@ -178,10 +178,10 @@ process_domain() {
   domain_file=$(echo "$domain" | tr . _)
   output_file="${domain_file}.wbw"
   tmpfile=$(mktemp)
+  trap 'rm -f "$tmpfile" "$tmpfile_gau" "$tmpfile_urlfinder" "$tmpfile_ps"' EXIT
   tmpfile_gau=$(mktemp)
   tmpfile_urlfinder=$(mktemp)
   tmpfile_ps=$(mktemp)
-  trap 'rm -f "$tmpfile" "$tmpfile_gau" "$tmpfile_urlfinder" "$tmpfile_ps"' EXIT
   start_time=$(date +"%H:%M:%S")
 
   # Log start
@@ -213,7 +213,7 @@ process_domain() {
   fi
 
   if ! _skip_tool "paramspider" "$skip_list"; then
-    paramspider -d "$domain" -o "$tmpfile_ps" 2>/dev/null || true
+    paramspider -d "$domain" -o "$tmpfile_ps" >/dev/null 2>&1 || true
     [ -s "$tmpfile_ps" ] && grep -v '^$' "$tmpfile_ps" >>"$tmpfile"
   fi
 
