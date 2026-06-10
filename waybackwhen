@@ -11,6 +11,7 @@ skip_tools=""
 input_file=""
 concurrency=1
 log_file=""
+stdout_mode=false
 exclude_pattern=".css|.jpg|.jpeg|.png|.svg|.img|.gif|.mp4|.flv|.ogv|.webm|.webp|.mov|.mp3|.m4a|.m4p|.scss|.tif|.tiff|.ttf|.otf|.woff|.woff2|.bmp|.ico|.eot|.htc|.rtf|.swf|.image|/image|/img|/css|/wp-json|/wp-content|/wp-includes|/theme|/audio|/captcha|/font|node_modules|/jquery|/bootstrap"
 
 # --- Parse args ---
@@ -23,9 +24,10 @@ while [[ $# -gt 0 ]]; do
     -f|--file)     input_file="$2"; shift 2 ;;
     -p|--parallel) concurrency="$2"; shift 2 ;;
     -l|--log)      log_file="$2"; shift 2 ;;
+    --stdout)      stdout_mode=true; shift ;;
     -*)
       echo "[!] Unknown option: $1"
-      echo "Usage: $0 [--exclude|-e] [--apex|-a] [--check|-c] [--skip|-s tools] [--file|-f file] [--parallel|-p N] [--log|-l logfile] [domain]"
+      echo "Usage: $0 [--exclude|-e] [--apex|-a] [--check|-c] [--stdout] [--skip|-s tools] [--file|-f file] [--parallel|-p N] [--log|-l logfile] [domain]"
       exit 1 ;;
     *) single_domain="$1"; shift ;;
   esac
@@ -178,15 +180,16 @@ process_domain() {
   domain_file=$(echo "$domain" | tr . _)
   output_file="${domain_file}.wbw"
   tmpfile=$(mktemp)
-  trap 'rm -f "$tmpfile" "$tmpfile_gau" "$tmpfile_urlfinder" "$tmpfile_ps"' EXIT
+  trap 'rm -f "$tmpfile" "$tmpfile_gau" "$tmpfile_urlfinder" "$tmpfile_ps" "$results_tmp"' EXIT
   tmpfile_gau=$(mktemp)
   tmpfile_urlfinder=$(mktemp)
   tmpfile_ps=$(mktemp)
+  results_tmp=$(mktemp)
   start_time=$(date +"%H:%M:%S")
 
   # Log start
   [ -n "$log_file" ] && echo "[+] $domain started at $start_time" >>"$log_file"
-  echo "[*] Enumerating: $domain"
+  [ "$stdout_mode" = "true" ] && echo "[*] Enumerating: $domain" >&2 || echo "[*] Enumerating: $domain"
 
   # --- Run tools ---
   # gau and urlfinder run in parallel (different backends, no Wayback contention)
@@ -224,34 +227,48 @@ process_domain() {
 
   # --- Process results ---
   if $exclude_flag; then
-    grep -Ev "$exclude_pattern" "$tmpfile" | sort -u >"$output_file"
+    grep -Ev "$exclude_pattern" "$tmpfile" | sort -u >"$results_tmp"
   else
-    sort -u "$tmpfile" >"$output_file"
+    sort -u "$tmpfile" >"$results_tmp"
   fi
   rm -f "$tmpfile"
 
-  number_of_findings=$(grep -Ev '^[[:space:]]*$' "$output_file" | wc -l)
+  number_of_findings=$(grep -cv '^[[:space:]]*$' "$results_tmp")
   end_time=$(date +"%H:%M:%S")
 
-  if [ "$number_of_findings" -gt 0 ]; then
-    echo "[+] $domain completed ($number_of_findings URLs)"
-    [ -n "$log_file" ] && echo "[✓] $domain completed at $end_time → $number_of_findings URLs" >>"$log_file"
+  if [ "$stdout_mode" = "true" ]; then
+    cat "$results_tmp"
+    if [ "$number_of_findings" -gt 0 ]; then
+      echo "[+] $domain completed ($number_of_findings URLs)" >&2
+      [ -n "$log_file" ] && echo "[✓] $domain completed at $end_time → $number_of_findings URLs" >>"$log_file"
+    else
+      echo "[-] $domain produced no results." >&2
+      [ -n "$log_file" ] && echo "[-] $domain completed at $end_time → 0 URLs" >>"$log_file"
+    fi
   else
-    echo "[-] $domain produced no results. Deleting output."
-    rm -f "$output_file"
-    [ -n "$log_file" ] && echo "[-] $domain completed at $end_time → 0 URLs (deleted)" >>"$log_file"
+    if [ "$number_of_findings" -gt 0 ]; then
+      mv "$results_tmp" "$output_file"
+      echo "[+] $domain completed ($number_of_findings URLs)"
+      [ -n "$log_file" ] && echo "[✓] $domain completed at $end_time → $number_of_findings URLs" >>"$log_file"
+    else
+      echo "[-] $domain produced no results. Deleting output."
+      [ -n "$log_file" ] && echo "[-] $domain completed at $end_time → 0 URLs (deleted)" >>"$log_file"
+    fi
   fi
 }
 
 export -f process_domain
 export exclude_pattern
+export stdout_mode
 
 # --- Parallel Execution ---
-printf "[*] Starting enumeration with concurrency: %s\n" "$concurrency"
-printf "[*] Exclusions: %s\n" "$($apply_exclude && echo Enabled || echo Disabled)"
-printf "[*] Apex mode:  %s\n" "$($apply_apex && echo Enabled || echo Disabled)"
-printf "[*] Skip tools: %s\n\n" "${skip_tools:-none}"
+_hfd=1; [ "$stdout_mode" = "true" ] && _hfd=2
+printf "[*] Starting enumeration with concurrency: %s\n" "$concurrency" >&$_hfd
+printf "[*] Exclusions: %s\n" "$($apply_exclude && echo Enabled || echo Disabled)" >&$_hfd
+printf "[*] Apex mode:  %s\n" "$($apply_apex && echo Enabled || echo Disabled)" >&$_hfd
+printf "[*] Output:     %s\n" "$($stdout_mode && echo stdout || echo file)" >&$_hfd
+printf "[*] Skip tools: %s\n\n" "${skip_tools:-none}" >&$_hfd
 
 printf "%s\n" "${domains[@]}" | xargs -P "$concurrency" -I {} bash -c 'process_domain "{}" '"$apply_exclude"' "'"$log_file"'" '"$apply_apex"' "'"$skip_tools"'"'
-echo -e "\n[✓] All domains processed at $(date +"%H:%M:%S")."
-[ -n "$log_file" ] && echo "[*] Full log saved to: $log_file"
+echo -e "\n[✓] All domains processed at $(date +"%H:%M:%S")." >&$_hfd
+[ -n "$log_file" ] && echo "[*] Full log saved to: $log_file" >&$_hfd
