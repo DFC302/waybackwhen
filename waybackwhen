@@ -2,36 +2,73 @@
 # =========================================
 # Multi-source URL Enumerator (Improved Version)
 # Simplified logging + deletes empty results
+# Adds: per-tool retry/backoff, empty-domain requeue,
+#       and an optional low-concurrency lane for archive tools.
 # =========================================
 
 apply_exclude=false
-apply_apex=false
+exact_mode=false
 run_check=false
 skip_tools=""
 input_file=""
 concurrency=1
 log_file=""
 stdout_mode=false
+
+# --- Resilience knobs ---
+max_retries=2        # per-tool retries on hard failure (non-zero exit)
+requeue_retries=1    # whole-domain retries when the merged result is empty
+backoff_base=5       # base backoff seconds; delay = base * attempt
+archive_slots=0      # >0 = max domains hitting the archive lane at once (0 = unlimited)
+
 exclude_pattern=".css|.jpg|.jpeg|.png|.svg|.img|.gif|.mp4|.flv|.ogv|.webm|.webp|.mov|.mp3|.m4a|.m4p|.scss|.tif|.tiff|.ttf|.otf|.woff|.woff2|.bmp|.ico|.eot|.htc|.rtf|.swf|.image|/image|/img|/css|/wp-json|/wp-content|/wp-includes|/theme|/audio|/captcha|/font|node_modules|/jquery|/bootstrap"
+
+# --- Tool locations (overridable via env, mainly for testing) ---
+: "${WBW_GAU:=$HOME/go/bin/gau}"
+: "${WBW_URLFINDER:=$HOME/go/bin/urlfinder}"
+: "${WBW_WAYBACKURLS:=$HOME/go/bin/waybackurls}"
+: "${WBW_PYTHON:=python3}"
+: "${WBW_WAYMORE_PY:=$HOME/tools/waymore/waymore.py}"
+: "${WBW_PARAMSPIDER:=paramspider}"
 
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -e|--exclude)  apply_exclude=true; shift ;;
-    -a|--apex)     apply_apex=true; shift ;;
-    -c|--check)    run_check=true; shift ;;
-    -s|--skip)     skip_tools="$2"; shift 2 ;;
-    -f|--file)     input_file="$2"; shift 2 ;;
-    -p|--parallel) concurrency="$2"; shift 2 ;;
-    -l|--log)      log_file="$2"; shift 2 ;;
-    --stdout)      stdout_mode=true; shift ;;
+    -e|--exclude)       apply_exclude=true; shift ;;
+    -x|--exact)         exact_mode=true; shift ;;
+    -c|--check)         run_check=true; shift ;;
+    -s|--skip)          skip_tools="$2"; shift 2 ;;
+    -f|--file)          input_file="$2"; shift 2 ;;
+    -p|--parallel)      concurrency="$2"; shift 2 ;;
+    -l|--log)           log_file="$2"; shift 2 ;;
+    -r|--retries)       max_retries="$2"; shift 2 ;;
+    -q|--requeue)       requeue_retries="$2"; shift 2 ;;
+    -b|--backoff)       backoff_base="$2"; shift 2 ;;
+    -a|--archive-slots) archive_slots="$2"; shift 2 ;;
+    --stdout)           stdout_mode=true; shift ;;
     -*)
       echo "[!] Unknown option: $1"
-      echo "Usage: $0 [--exclude|-e] [--apex|-a] [--check|-c] [--stdout] [--skip|-s tools] [--file|-f file] [--parallel|-p N] [--log|-l logfile] [domain]"
+      echo "Usage: $0 [--exclude|-e] [--exact|-x] [--check|-c] [--stdout]"
+      echo "          [--skip|-s tools] [--file|-f file] [--parallel|-p N] [--log|-l logfile]"
+      echo "          [--retries|-r N] [--requeue|-q N] [--backoff|-b SECONDS] [--archive-slots|-a N]"
+      echo "          [domain]"
       exit 1 ;;
     *) single_domain="$1"; shift ;;
   esac
 done
+
+# --- Validate numeric knobs ---
+for _v in concurrency max_retries requeue_retries backoff_base archive_slots; do
+  if ! [[ "${!_v}" =~ ^[0-9]+$ ]]; then
+    echo "[!] --$_v must be a non-negative integer (got: '${!_v}')"
+    exit 1
+  fi
+done
+if [ "$concurrency" -lt 1 ]; then
+  echo "[!] --parallel must be >= 1"
+  exit 1
+fi
+unset _v
 
 # --- Validate --skip tool names ---
 _valid_tools="waybackurls gau urlfinder waymore paramspider"
@@ -125,7 +162,7 @@ import sys
 try:
     import tldextract
     result = tldextract.extract(sys.argv[1])
-    apex = result.registered_domain
+    apex = getattr(result, "top_domain_under_public_suffix", None) or result.registered_domain
     print(apex if apex else sys.argv[1])
 except ImportError:
     # Fallback: take last two labels
@@ -140,8 +177,76 @@ _skip_tool() {
   [[ ",$skip_list," == *",$tool,"* ]]
 }
 
-export -f extract_apex
-export -f _skip_tool
+# --- Log helper (no-op when no --log given) ---
+log() {
+  [ -n "$log_file" ] && echo "$1" >>"$log_file"
+}
+
+# --- Retry wrapper: re-run a tool runner with exponential backoff on hard
+#     (non-zero exit) failure. Tools that exit 0 on a silent throttle are
+#     handled by the whole-domain requeue instead. ---
+run_with_retry() {
+  local label="$1"; shift
+  local attempt=0 rc=0
+  while :; do
+    "$@"
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$attempt" -ge "$max_retries" ]; then
+      log "[!] $label failed after $((attempt + 1)) attempt(s) (rc=$rc)"
+      return "$rc"
+    fi
+    attempt=$((attempt + 1))
+    local delay=$((backoff_base * attempt))
+    log "[~] $label attempt $attempt failed (rc=$rc), backing off ${delay}s"
+    sleep "$delay"
+  done
+}
+
+# --- Archive-lane semaphore (counting, via FIFO on fd 200) ---
+# Limits how many domains hit waybackurls/waymore/paramspider at once so a
+# high -P does not stampede web.archive.org. No-op when archive_slots == 0.
+archive_acquire() {
+  [ "${archive_slots:-0}" -gt 0 ] || return 0
+  if read -r -u 200 _ 2>/dev/null; then
+    _archive_held=1
+  fi
+}
+archive_release() {
+  [ "${archive_slots:-0}" -gt 0 ] || return 0
+  [ "${_archive_held:-0}" -eq 1 ] || return 0
+  printf '\n' >&200 2>/dev/null
+  _archive_held=0
+}
+
+# --- Per-tool runners (each truncates its own tmpfile so retries don't
+#     accumulate duplicate output). Exit code is the tool's exit code. ---
+run_gau() {
+  : >"$tmpfile_gau"
+  "$WBW_GAU" "$domain" >>"$tmpfile_gau" 2>/dev/null
+}
+run_urlfinder() {
+  : >"$tmpfile_urlfinder"
+  echo "$domain" | "$WBW_URLFINDER" -silent >>"$tmpfile_urlfinder" 2>/dev/null
+}
+run_waybackurls() {
+  : >"$tmpfile_wb"
+  echo "$domain" | "$WBW_WAYBACKURLS" >>"$tmpfile_wb" 2>/dev/null
+}
+run_waymore() {
+  : >"$tmpfile_wm"
+  "$WBW_PYTHON" "$WBW_WAYMORE_PY" -i "$domain" -mode U -oU "$tmpfile_wm" >/dev/null 2>&1
+}
+run_paramspider() {
+  : >"$tmpfile_ps"
+  local _raw rc
+  _raw=$(mktemp)
+  "$WBW_PARAMSPIDER" -d "$domain" -o "$_raw" >/dev/null 2>&1
+  rc=$?
+  [ -s "$_raw" ] && grep -v '^$' "$_raw" >>"$tmpfile_ps"
+  rm -f "$_raw"
+  return "$rc"
+}
 
 # --- Build domain list ---
 if [ -n "$input_file" ]; then
@@ -160,115 +265,181 @@ if [ -n "$log_file" ]; then
   echo "[*] Run started at $timestamp" >"$log_file"
 fi
 
+# --- Per-domain cleanup ---
+_cleanup() {
+  archive_release   # return our token if we died mid-lane (no-op otherwise)
+  rm -f "$tmpfile" "$tmpfile_gau" "$tmpfile_urlfinder" "$tmpfile_wb" \
+        "$tmpfile_wm" "$tmpfile_ps" "$results_tmp" 2>/dev/null
+}
+
 # --- Core Function ---
 process_domain() {
   domain="$1"
   exclude_flag="$2"
   log_file="$3"
-  apex_flag="$4"
+  exact_flag="$4"
   skip_list="$5"
 
   domain=$(echo "$domain" | sed -E 's#https?://##;s#/$##')
   [ -z "$domain" ] && return
 
-  # Strip to apex if requested
-  if [ "$apex_flag" = "true" ]; then
+  # Default: extract apex. --exact preserves the literal input.
+  if [ "$exact_flag" != "true" ]; then
+    original="$domain"
     domain=$(extract_apex "$domain")
     [ -z "$domain" ] && return
+    if [ "$original" != "$domain" ]; then
+      [ "$stdout_mode" = "true" ] && echo "[*] Apex extracted: $original → $domain" >&2 \
+                                  || echo "[*] Apex extracted: $original → $domain"
+    fi
   fi
 
   domain_file=$(echo "$domain" | tr . _)
   output_file="${domain_file}.wbw"
   tmpfile=$(mktemp)
-  trap 'rm -f "$tmpfile" "$tmpfile_gau" "$tmpfile_urlfinder" "$tmpfile_ps" "$results_tmp"' EXIT
   tmpfile_gau=$(mktemp)
   tmpfile_urlfinder=$(mktemp)
+  tmpfile_wb=$(mktemp)
+  tmpfile_wm=$(mktemp)
   tmpfile_ps=$(mktemp)
   results_tmp=$(mktemp)
+  _archive_held=0
+  trap _cleanup EXIT
+
   start_time=$(date +"%H:%M:%S")
 
+  # Is the archive lane active for this domain at all?
+  _archive_active=false
+  if ! _skip_tool "waybackurls" "$skip_list" \
+     || ! _skip_tool "waymore" "$skip_list" \
+     || ! _skip_tool "paramspider" "$skip_list"; then
+    _archive_active=true
+  fi
+
   # Log start
-  [ -n "$log_file" ] && echo "[+] $domain started at $start_time" >>"$log_file"
+  log "[+] $domain started at $start_time"
   [ "$stdout_mode" = "true" ] && echo "[*] Enumerating: $domain" >&2 || echo "[*] Enumerating: $domain"
 
-  # --- Run tools ---
-  # gau and urlfinder run in parallel (different backends, no Wayback contention)
-  pid_gau=""
-  pid_urlfinder=""
+  number_of_findings=0
+  attempt=0
+  while :; do
+    : >"$tmpfile"
 
-  if ! _skip_tool "gau" "$skip_list"; then
-    ~/go/bin/gau "$domain" 2>/dev/null >>"$tmpfile_gau" &
-    pid_gau=$!
-  fi
+    # --- gau and urlfinder run in parallel (different backends) ---
+    pid_gau=""
+    pid_urlfinder=""
+    if ! _skip_tool "gau" "$skip_list"; then
+      run_with_retry "gau:$domain" run_gau &
+      pid_gau=$!
+    fi
+    if ! _skip_tool "urlfinder" "$skip_list"; then
+      run_with_retry "urlfinder:$domain" run_urlfinder &
+      pid_urlfinder=$!
+    fi
 
-  if ! _skip_tool "urlfinder" "$skip_list"; then
-    echo "$domain" | ~/go/bin/urlfinder -silent 2>/dev/null >>"$tmpfile_urlfinder" &
-    pid_urlfinder=$!
-  fi
+    # --- archive lane: waybackurls, waymore, paramspider (all hit archives) ---
+    $_archive_active && archive_acquire
+    if ! _skip_tool "waybackurls" "$skip_list"; then
+      run_with_retry "waybackurls:$domain" run_waybackurls
+    fi
+    if ! _skip_tool "waymore" "$skip_list"; then
+      run_with_retry "waymore:$domain" run_waymore
+    fi
+    if ! _skip_tool "paramspider" "$skip_list"; then
+      run_with_retry "paramspider:$domain" run_paramspider
+    fi
+    $_archive_active && archive_release
 
-  # waybackurls, waymore, paramspider run sequentially (all hit Wayback/archives)
-  if ! _skip_tool "waybackurls" "$skip_list"; then
-    echo "$domain" | ~/go/bin/waybackurls 2>/dev/null >>"$tmpfile"
-  fi
+    # Wait for parallel tools and merge everything
+    [ -n "$pid_gau" ] && wait "$pid_gau"
+    [ -n "$pid_urlfinder" ] && wait "$pid_urlfinder"
+    cat "$tmpfile_gau" "$tmpfile_urlfinder" "$tmpfile_wb" "$tmpfile_wm" "$tmpfile_ps" 2>/dev/null >>"$tmpfile"
 
-  if ! _skip_tool "waymore" "$skip_list"; then
-    python3 ~/tools/waymore/waymore.py -i "$domain" -mode U -oU "$tmpfile" >/dev/null 2>&1
-  fi
+    # --- Process results ---
+    if $exclude_flag; then
+      grep -Ev "$exclude_pattern" "$tmpfile" | sort -u >"$results_tmp"
+    else
+      sort -u "$tmpfile" >"$results_tmp"
+    fi
 
-  if ! _skip_tool "paramspider" "$skip_list"; then
-    paramspider -d "$domain" -o "$tmpfile_ps" >/dev/null 2>&1 || true
-    [ -s "$tmpfile_ps" ] && grep -v '^$' "$tmpfile_ps" >>"$tmpfile"
-  fi
+    number_of_findings=$(grep -cv '^[[:space:]]*$' "$results_tmp")
 
-  # Wait for parallel tools and merge
-  [ -n "$pid_gau" ] && wait "$pid_gau"
-  [ -n "$pid_urlfinder" ] && wait "$pid_urlfinder"
-  cat "$tmpfile_gau" "$tmpfile_urlfinder" >>"$tmpfile"
+    # Got results, or out of requeue attempts -> stop.
+    if [ "$number_of_findings" -gt 0 ] || [ "$attempt" -ge "$requeue_retries" ]; then
+      break
+    fi
 
-  # --- Process results ---
-  if $exclude_flag; then
-    grep -Ev "$exclude_pattern" "$tmpfile" | sort -u >"$results_tmp"
-  else
-    sort -u "$tmpfile" >"$results_tmp"
-  fi
-  rm -f "$tmpfile"
+    attempt=$((attempt + 1))
+    delay=$((backoff_base * attempt))
+    log "[~] $domain empty after attempt $attempt, requeue in ${delay}s"
+    [ "$stdout_mode" = "true" ] \
+      && echo "[~] $domain empty, retrying in ${delay}s ($attempt/$requeue_retries)" >&2 \
+      || echo "[~] $domain empty, retrying in ${delay}s ($attempt/$requeue_retries)"
+    sleep "$delay"
+  done
 
-  number_of_findings=$(grep -cv '^[[:space:]]*$' "$results_tmp")
   end_time=$(date +"%H:%M:%S")
 
   if [ "$stdout_mode" = "true" ]; then
     cat "$results_tmp"
     if [ "$number_of_findings" -gt 0 ]; then
       echo "[+] $domain completed ($number_of_findings URLs)" >&2
-      [ -n "$log_file" ] && echo "[✓] $domain completed at $end_time → $number_of_findings URLs" >>"$log_file"
+      log "[✓] $domain completed at $end_time → $number_of_findings URLs"
     else
       echo "[-] $domain produced no results." >&2
-      [ -n "$log_file" ] && echo "[-] $domain completed at $end_time → 0 URLs" >>"$log_file"
+      log "[-] $domain completed at $end_time → 0 URLs"
     fi
   else
     if [ "$number_of_findings" -gt 0 ]; then
       mv "$results_tmp" "$output_file"
       echo "[+] $domain completed ($number_of_findings URLs)"
-      [ -n "$log_file" ] && echo "[✓] $domain completed at $end_time → $number_of_findings URLs" >>"$log_file"
+      log "[✓] $domain completed at $end_time → $number_of_findings URLs"
     else
       echo "[-] $domain produced no results. Deleting output."
-      [ -n "$log_file" ] && echo "[-] $domain completed at $end_time → 0 URLs (deleted)" >>"$log_file"
+      log "[-] $domain completed at $end_time → 0 URLs (deleted)"
     fi
   fi
 }
 
-export -f process_domain
-export exclude_pattern
-export stdout_mode
+export -f process_domain extract_apex _skip_tool _cleanup log run_with_retry \
+          archive_acquire archive_release \
+          run_gau run_urlfinder run_waybackurls run_waymore run_paramspider
+export exclude_pattern stdout_mode
+export max_retries requeue_retries backoff_base archive_slots
+export WBW_GAU WBW_URLFINDER WBW_WAYBACKURLS WBW_PYTHON WBW_WAYMORE_PY WBW_PARAMSPIDER
+
+# --- Archive-lane semaphore setup (parent opens fd 200; children inherit it) ---
+# More slots than workers is pointless and could overflow the FIFO buffer at
+# seed time, so clamp to the worker count.
+if [ "$archive_slots" -gt "$concurrency" ]; then
+  archive_slots=$concurrency
+  export archive_slots
+fi
+if [ "$archive_slots" -gt 0 ]; then
+  _sem_fifo=$(mktemp -u)
+  if ! mkfifo "$_sem_fifo" 2>/dev/null; then
+    echo "[!] Failed to create archive-lane semaphore; continuing without it."
+    archive_slots=0
+    export archive_slots
+  else
+    exec 200<>"$_sem_fifo"
+    rm -f "$_sem_fifo"   # unlink; the open fd keeps the pipe alive
+    for ((_i = 0; _i < archive_slots; _i++)); do printf '\n' >&200; done
+    unset _i
+  fi
+fi
 
 # --- Parallel Execution ---
 _hfd=1; [ "$stdout_mode" = "true" ] && _hfd=2
 printf "[*] Starting enumeration with concurrency: %s\n" "$concurrency" >&$_hfd
-printf "[*] Exclusions: %s\n" "$($apply_exclude && echo Enabled || echo Disabled)" >&$_hfd
-printf "[*] Apex mode:  %s\n" "$($apply_apex && echo Enabled || echo Disabled)" >&$_hfd
-printf "[*] Output:     %s\n" "$($stdout_mode && echo stdout || echo file)" >&$_hfd
-printf "[*] Skip tools: %s\n\n" "${skip_tools:-none}" >&$_hfd
+printf "[*] Exclusions:    %s\n" "$($apply_exclude && echo Enabled || echo Disabled)" >&$_hfd
+printf "[*] Mode:          %s\n" "$($exact_mode && echo 'exact (literal input)' || echo 'apex (auto-strip subdomains)')" >&$_hfd
+printf "[*] Output:        %s\n" "$($stdout_mode && echo stdout || echo file)" >&$_hfd
+printf "[*] Skip tools:    %s\n" "${skip_tools:-none}" >&$_hfd
+printf "[*] Tool retries:  %s   Requeue (empty): %s   Backoff base: %ss\n" "$max_retries" "$requeue_retries" "$backoff_base" >&$_hfd
+printf "[*] Archive slots: %s\n\n" "$([ "$archive_slots" -gt 0 ] && echo "$archive_slots" || echo 'unlimited')" >&$_hfd
 
-printf "%s\n" "${domains[@]}" | xargs -P "$concurrency" -I {} bash -c 'process_domain "{}" '"$apply_exclude"' "'"$log_file"'" '"$apply_apex"' "'"$skip_tools"'"'
+printf "%s\n" "${domains[@]}" | xargs -P "$concurrency" -I {} bash -c 'process_domain "{}" '"$apply_exclude"' "'"$log_file"'" '"$exact_mode"' "'"$skip_tools"'"'
 echo -e "\n[✓] All domains processed at $(date +"%H:%M:%S")." >&$_hfd
 [ -n "$log_file" ] && echo "[*] Full log saved to: $log_file" >&$_hfd
+exit 0

@@ -1,0 +1,5 @@
+# Scan output
+*.wbw
+
+# Run logs
+*.log
