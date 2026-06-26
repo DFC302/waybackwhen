@@ -192,6 +192,39 @@ waybackwhen -f domains.txt -p 20 -a 4
 ```bash
 waybackwhen -f domains.txt -p 20 -a 4 -q 1 -b 8 -l run.log
 ```
+`-p 20` keeps 20 domains in flight (gau/urlfinder run at full width) while `-a 4`
+lets only 4 touch the archive tools at once; `-q 1` retries a domain that came
+back empty (a common throttling symptom) and `-b 8` sets the backoff base.
+
+### Running on large lists
+
+One thing to know before pointing this at a big file: **apexes are not
+de-duplicated.** In the default apex mode, `api.foo.com`, `www.foo.com`, and
+`foo.com` are three separate jobs that all collapse to `foo.com` — three full
+enumerations of the same apex (and three times the archive API calls, all
+writing to the same `foo_com.wbw`). On a large subdomain list this multiplies
+your rate-limit exposure and works against `-a`. Two ways to avoid it:
+
+**Collapse to unique apexes first (each apex runs once):**
+```bash
+# requires tldextract (already a dependency)
+python3 -c 'import sys,tldextract
+for l in sys.stdin:
+    l=l.strip()
+    if not l: continue
+    e=tldextract.extract(l)
+    print(getattr(e,"top_domain_under_public_suffix",None) or e.registered_domain)' \
+  < subdomains.txt | sort -u > apexes.txt
+waybackwhen -f apexes.txt -p 20 -a 4 -q 1 -b 8 -l run.log
+```
+
+**Or scan each host literally (no apex collapse, per-subdomain output):**
+```bash
+waybackwhen -f subdomains.txt --exact -p 20 -a 4 -q 1 -b 8 -l run.log
+```
+
+For very large lists, also consider `--skip waymore` for a faster (if slightly
+less thorough) run, since waymore is the slowest and most rate-limited source.
 
 ---
 
